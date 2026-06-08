@@ -18,8 +18,9 @@
 # ─────────────────────────────────────────────
 import sys
 import io
-# Forzar UTF-8 en stdout para que los emojis funcionen en Windows (cp1252)
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# Forzar UTF-8 en stdout solo si aún no está configurado (evita doble wrapping)
+if getattr(sys.stdout, 'encoding', '').lower() != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import os
 from typing import TypedDict, Annotated, Literal
