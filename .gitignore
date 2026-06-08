@@ -1,0 +1,7 @@
+# Nunca subir el .env real al repositorio (contiene la API Key)
+.env
+
+# Caché de Python
+__pycache__/
+*.pyc
+*.pyo
