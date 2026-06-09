@@ -2,16 +2,40 @@
 =============================================================================
   SISTEMA DE AGENTES PARA RESTAURANTE --- Proyecto LangGraph + OpenAI
 =============================================================================
-  Arquitectura: StateGraph cíclico con nodos agent, ver_menu y crear_reserva.
-  Flujo:
-    __start__ -> agent -> [router] -> ver_menu      -> agent -> END
-                                   -> crear_reserva -> agent -> END  ← INTERRUPT antes
-                                   -> END
+  Arquitectura: StateGraph con PARALELISMO (Send API fan-out / fan-in)
+
+  FLUJO COMPLETO:
+  ───────────────────────────────────────────────────────────────────────
+  __start__ → agent → [router]
+                          │
+                          ├─► ver_menu_dispatcher ──┬─► nodo_entrantes   ─┐
+                          │    (Send x3 en paralelo) ├─► nodo_principales ─┤
+                          │                          └─► nodo_postres      ┘
+                          │                                ↓ fan-in
+                          │                       ver_menu_aggregator → agent → END
+                          │
+                          ├─► prereserva_dispatcher ──┬─► nodo_verificar_disp. ─┐
+                          │    (Send x2 en paralelo)  └─► nodo_calcular_precio  ┘
+                          │                                  ↓ fan-in
+                          │                         prereserva_aggregator
+                          │                                  ↓
+                          │                         crear_reserva  ← ⏸ INTERRUPT (HITL)
+                          │                                  ↓
+                          │                              agent → END
+                          │
+                          └─► END
 
   Human-in-the-Loop (HITL):
-    - MemorySaver:         persiste el estado entre turnos (memoria de conversación).
-    - interrupt_before:    pausa el grafo ANTES de ejecutar crear_reserva para
-                           que el usuario apruebe o rechace la reserva.
+    - MemorySaver:      persiste el estado entre turnos (memoria de conversación).
+    - interrupt_before: pausa el grafo ANTES de ejecutar crear_reserva para
+                        que el usuario apruebe o rechace la reserva.
+
+  Paralelismo con Send API:
+    - ver_menu_dispatcher  usa Send() para lanzar 3 nodos de menú en paralelo.
+    - prereserva_dispatcher usa Send() para lanzar 2 nodos de verificación en
+      paralelo antes de crear la reserva.
+    - Los agregadores reciben los resultados parciales (vía operator.add en el
+      estado compartido) y los componen en un único mensaje.
 =============================================================================
 """
 
@@ -24,13 +48,15 @@ if getattr(sys.stdout, 'encoding', '').lower() != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import os
-from typing import TypedDict, Annotated, Literal
+import operator
+from typing import TypedDict, Annotated, Literal, Union
 
 from dotenv import load_dotenv
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import MemorySaver          # ← NUEVO: checkpointer
+from langgraph.types import Send                              # ← Send API para paralelismo
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_openai import AzureChatOpenAI
 
@@ -82,6 +108,19 @@ llm = AzureChatOpenAI(
 class EstadoRestaurante(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
+    # ── Resultados parciales del fan-out del menú ──
+    # operator.add concatena las listas cuando varios nodos paralelos
+    # escriben en el mismo campo (cada nodo añade su fragmento).
+    secciones_menu: Annotated[list[str], operator.add]
+
+    # ── Resultados del fan-out de pre-reserva ──
+    info_prereserva: Annotated[list[str], operator.add]
+
+
+# ── Sub-estado para el procesamiento paralelo de cada categoría (Map-Reduce) ──
+class CategoriaMenuState(TypedDict):
+    categoria: str
+
 
 # ─────────────────────────────────────────────
 # 5. BASE DE DATOS SIMULADA DEL RESTAURANTE
@@ -115,6 +154,9 @@ Tus capacidades son:
 
 Cuando recibas los datos de una herramienta (menú o reserva confirmada),
 preséntaselos al cliente de forma clara, amigable y en español.
+Si recibes [PRE_RESERVA], muestra al cliente la disponibilidad de mesa y el precio
+estimado de forma amigable, e indícale que en un momento se le pedirá confirmación
+para registrar la reserva.
 Si recibes [RESERVA_CANCELADA], informa amablemente al cliente de que la reserva
 no se ha registrado y ofrécele ayuda para cuando quiera intentarlo de nuevo.
 Si el cliente solo saluda o hace una pregunta general, responde brevemente
@@ -146,32 +188,198 @@ def nodo_agent(estado: EstadoRestaurante) -> EstadoRestaurante:
     return {"messages": [respuesta_llm]}
 
 
-# ─────────────────────────────────────────────
-# 7. NODO: "ver_menu"
-# ─────────────────────────────────────────────
-def nodo_ver_menu(estado: EstadoRestaurante) -> EstadoRestaurante:
-    print("\n" + "-"*60)
-    print("  🍽️   NODO: ver_menu  (consultando base de datos...)")
-    print("-"*60)
+# ═════════════════════════════════════════════
+# ███  PARALELISMO 1: MAP-REDUCE DEL MENÚ   ███
+# ═════════════════════════════════════════════
 
-    lineas = [f"DATOS DEL MENÚ DEL DÍA ({datetime.date.today().strftime('%d/%m/%Y')}):\n"]
-    for categoria, platos in MENU_DEL_DIA.items():
-        lineas.append(f"\n{categoria.upper()}:")
-        for plato in platos:
-            lineas.append(
-                f"  - {plato['nombre']}: {plato['precio']:.2f}€  "
-                f"[Alérgenos: {plato['alergenos']}]"
-            )
 
+# ─────────────────────────────────────────────
+# 7b. MAPPER único: procesa una categoría
+# ─────────────────────────────────────────────
+def nodo_procesar_categoria(estado_seccion: CategoriaMenuState) -> dict:
+    """
+    Mapper (Fase MAP):
+    Procesa una única categoría del menú de forma paralela y
+    retorna su sección formateada.
+    """
+    categoria = estado_seccion["categoria"]
+    print(f"\n  🍽️   [MAP] nodo_procesar_categoria ejecutando para '{categoria}'...")
+    
+    platos = MENU_DEL_DIA.get(categoria, [])
+    lineas = [f"{categoria.upper()}:"]
+    for p in platos:
+        lineas.append(f"  - {p['nombre']}: {p['precio']:.2f}€  [Alérgenos: {p['alergenos']}]")
+    
     resultado = "\n".join(lineas)
-    print(f"  ✅ Menú generado ({len(MENU_DEL_DIA)} categorías, "
-          f"{sum(len(v) for v in MENU_DEL_DIA.values())} platos)")
-
-    return {"messages": [AIMessage(content=f"[MENU]\n{resultado}")]}
+    print(f"  ✅  [MAP] '{categoria}' completada con éxito.")
+    
+    # Escribe el fragmento en la lista del estado global (gracias a operator.add)
+    return {"secciones_menu": [resultado]}
 
 
 # ─────────────────────────────────────────────
-# 8. NODO: "crear_reserva"
+# 7c. AGGREGATOR del menú (REDUCE)
+# ─────────────────────────────────────────────
+def nodo_ver_menu_aggregator(estado: EstadoRestaurante) -> dict:
+    """
+    Aggregator (Fase REDUCE):
+    Consolida todos los fragmentos procesados en paralelo
+    y genera el mensaje definitivo con el menú integrado.
+    """
+    print("\n" + "◀"*60)
+    print("  🔗  MAP-REDUCE AGGREGATOR (REDUCE): ver_menu — uniendo resultados paralelos")
+    print("◀"*60)
+
+    secciones = estado.get("secciones_menu", [])
+    print(f"  📦  Secciones reducidas: {len(secciones)} / {len(MENU_DEL_DIA)}")
+
+    fecha = datetime.date.today().strftime("%d/%m/%Y")
+    cabecera = f"DATOS DEL MENÚ DEL DÍA ({fecha}):\n"
+    cuerpo = "\n\n".join(secciones)
+    mensaje_final = cabecera + cuerpo
+
+    print("  ✅  Fase de reducción (Reduce) completada con éxito.")
+    return {"messages": [AIMessage(content=f"[MENU]\n{mensaje_final}")]}
+
+
+# ═════════════════════════════════════════════
+# ███  PARALELISMO 2: FAN-OUT PRE-RESERVA  ███
+# ═════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────
+# 8b. NODO paralelo: verificar disponibilidad
+# ─────────────────────────────────────────────
+def nodo_verificar_disponibilidad(estado: EstadoRestaurante) -> dict:
+    """
+    Rama paralela: comprueba si hay mesas disponibles (simulado).
+    En producción consultaría una BD real de reservas.
+    """
+    print("\n  🪑  [PARALELO] nodo_verificar_disponibilidad ejecutando...")
+
+    # Extraer número de personas del último mensaje del usuario
+    mensaje_usuario = next(
+        (m.content for m in reversed(estado["messages"]) if isinstance(m, HumanMessage)),
+        ""
+    ).lower()
+
+    personas = 2
+    for num, palabras in [
+        (1, ["una persona", "1 persona"]),
+        (2, ["dos personas", "2 personas"]),
+        (3, ["tres personas", "3 personas"]),
+        (4, ["cuatro personas", "4 personas"]),
+        (5, ["cinco personas", "5 personas"]),
+        (6, ["seis personas", "6 personas"]),
+    ]:
+        if any(p in mensaje_usuario for p in palabras):
+            personas = num
+            break
+
+    # Simulación: mesas disponibles si hay menos de 10 reservas activas
+    reservas_activas = len(RESERVAS_REGISTRADAS)
+    capacidad_total  = 10
+    disponible       = reservas_activas < capacidad_total
+    mesas_libres     = max(0, capacidad_total - reservas_activas)
+
+    if disponible:
+        resultado = (
+            f"✅ DISPONIBILIDAD: Mesa disponible para {personas} personas.\n"
+            f"   Mesas libres en el sistema: {mesas_libres}/{capacidad_total}"
+        )
+    else:
+        resultado = (
+            f"⚠️  DISPONIBILIDAD: Sin mesas libres para {personas} personas.\n"
+            f"   Capacidad completa ({reservas_activas}/{capacidad_total} mesas ocupadas)."
+        )
+
+    print(f"  ✅  nodo_verificar_disponibilidad → {'disponible' if disponible else 'sin disponibilidad'}")
+    return {"info_prereserva": [resultado]}
+
+
+# ─────────────────────────────────────────────
+# 8c. NODO paralelo: calcular precio estimado
+# ─────────────────────────────────────────────
+def nodo_calcular_precio(estado: EstadoRestaurante) -> dict:
+    """
+    Rama paralela: calcula el precio estimado para N personas
+    basándose en el menú del día (un plato de cada categoría por persona).
+    """
+    print("\n  💶  [PARALELO] nodo_calcular_precio ejecutando...")
+
+    mensaje_usuario = next(
+        (m.content for m in reversed(estado["messages"]) if isinstance(m, HumanMessage)),
+        ""
+    ).lower()
+
+    personas = 2
+    for num, palabras in [
+        (1, ["una persona", "1 persona"]),
+        (2, ["dos personas", "2 personas"]),
+        (3, ["tres personas", "3 personas"]),
+        (4, ["cuatro personas", "4 personas"]),
+        (5, ["cinco personas", "5 personas"]),
+        (6, ["seis personas", "6 personas"]),
+    ]:
+        if any(p in mensaje_usuario for p in palabras):
+            personas = num
+            break
+
+    # Precio medio de cada categoría
+    precio_medio_entrante   = sum(p["precio"] for p in MENU_DEL_DIA["entrantes"])   / len(MENU_DEL_DIA["entrantes"])
+    precio_medio_principal  = sum(p["precio"] for p in MENU_DEL_DIA["principales"]) / len(MENU_DEL_DIA["principales"])
+    precio_medio_postre     = sum(p["precio"] for p in MENU_DEL_DIA["postres"])     / len(MENU_DEL_DIA["postres"])
+    precio_medio_por_persona = precio_medio_entrante + precio_medio_principal + precio_medio_postre
+
+    precio_total_estimado = precio_medio_por_persona * personas
+    precio_min = (
+        min(p["precio"] for p in MENU_DEL_DIA["entrantes"]) +
+        min(p["precio"] for p in MENU_DEL_DIA["principales"]) +
+        min(p["precio"] for p in MENU_DEL_DIA["postres"])
+    ) * personas
+    precio_max = (
+        max(p["precio"] for p in MENU_DEL_DIA["entrantes"]) +
+        max(p["precio"] for p in MENU_DEL_DIA["principales"]) +
+        max(p["precio"] for p in MENU_DEL_DIA["postres"])
+    ) * personas
+
+    resultado = (
+        f"💶 PRECIO ESTIMADO para {personas} persona(s):\n"
+        f"   Precio medio por persona: {precio_medio_por_persona:.2f}€\n"
+        f"   Total estimado:           {precio_total_estimado:.2f}€\n"
+        f"   Rango (mín–máx):         {precio_min:.2f}€ – {precio_max:.2f}€"
+    )
+
+    print(f"  ✅  nodo_calcular_precio → {precio_total_estimado:.2f}€ estimado ({personas} personas)")
+    return {"info_prereserva": [resultado]}
+
+
+# ─────────────────────────────────────────────
+# 8d. AGGREGATOR pre-reserva — fan-in
+# ─────────────────────────────────────────────
+def nodo_prereserva_aggregator(estado: EstadoRestaurante) -> dict:
+    """
+    Aggregator pre-reserva (fan-in).
+
+    Combina la disponibilidad y el precio estimado en un mensaje
+    informativo que el agente presentará al usuario antes de confirmar.
+    """
+    print("\n" + "◀"*60)
+    print("  🔗  AGGREGATOR: pre-reserva — combinando 2 resultados paralelos")
+    print("◀"*60)
+
+    info = estado.get("info_prereserva", [])
+    print(f"  📦  Informes recibidos: {len(info)}")
+
+    cuerpo = "\n\n".join(info)
+    mensaje_final = f"[PRE_RESERVA]\n{cuerpo}"
+
+    print("  ✅  Pre-reserva agregada y lista para el agente")
+    return {"messages": [AIMessage(content=mensaje_final)]}
+
+
+# ─────────────────────────────────────────────
+# 9. NODO: "crear_reserva"
 # ─────────────────────────────────────────────
 # ⚠️  Este nodo tiene interrupt_before: el grafo se PAUSA antes de ejecutarlo
 #     y espera la aprobación humana desde chat_interactivo.py.
@@ -183,7 +391,6 @@ def nodo_crear_reserva(estado: EstadoRestaurante) -> EstadoRestaurante:
     mensajes = estado["messages"]
 
     # ── Usar el ÚLTIMO HumanMessage para extraer datos ──
-    # Con memoria multi-turno puede haber varios HumanMessages; queremos el más reciente.
     mensaje_usuario = next(
         (m.content for m in reversed(mensajes) if isinstance(m, HumanMessage)),
         "Reserva para 2 personas"
@@ -245,9 +452,11 @@ def nodo_crear_reserva(estado: EstadoRestaurante) -> EstadoRestaurante:
 
 
 # ─────────────────────────────────────────────
-# 9. ROUTER CONDICIONAL
+# 10. ROUTER CONDICIONAL
 # ─────────────────────────────────────────────
-def router_condicional(estado: EstadoRestaurante) -> Literal["ver_menu", "crear_reserva", "__end__"]:
+def router_condicional(
+    estado: EstadoRestaurante,
+) -> Union[list[Send], str]:
     print("\n" + "·"*60)
     print("  🔀  ROUTER: evaluando destino del flujo...")
     print("·"*60)
@@ -255,8 +464,6 @@ def router_condicional(estado: EstadoRestaurante) -> Literal["ver_menu", "crear_
     mensajes = estado["messages"]
 
     # ── CLAVE ANTI-BUCLE con soporte multi-turno ──
-    # Solo miramos los mensajes DESDE el último HumanMessage (turno actual).
-    # Así no confundimos herramientas de turnos anteriores con el turno actual.
     last_human_idx = max(
         (i for i, m in enumerate(mensajes) if isinstance(m, HumanMessage)),
         default=0
@@ -268,6 +475,7 @@ def router_condicional(estado: EstadoRestaurante) -> Literal["ver_menu", "crear_
             m.content.startswith("[MENU]")
             or m.content.startswith("[RESERVA]")
             or m.content.startswith("[RESERVA_CANCELADA]")
+            or m.content.startswith("[PRE_RESERVA]")
         )
         for m in mensajes_turno_actual
     )
@@ -277,7 +485,7 @@ def router_condicional(estado: EstadoRestaurante) -> Literal["ver_menu", "crear_
         print("  ✅ Decisión: → __end__")
         return "__end__"
 
-    # ── Extraer la intención del turno actual (último HumanMessage) ──
+    # ── Extraer la intención del turno actual ──
     mensaje_humano = next(
         (m.content for m in reversed(mensajes) if isinstance(m, HumanMessage)), ""
     )
@@ -298,65 +506,83 @@ def router_condicional(estado: EstadoRestaurante) -> Literal["ver_menu", "crear_
     ]
 
     if any(p in texto for p in palabras_menu):
-        print("  ✅ Decisión: → ver_menu")
-        return "ver_menu"
+        print("  ✅ Decisión (MAP): → nodo_procesar_categoria (Map-Reduce en paralelo x3)")
+        return [
+            Send("nodo_procesar_categoria", {"categoria": cat})
+            for cat in MENU_DEL_DIA.keys()
+        ]
     elif any(p in texto for p in palabras_reserva):
-        print("  ✅ Decisión: → crear_reserva")
-        return "crear_reserva"
+        print("  ✅ Decisión (MAP): → [verificar_disp. ‖ calcular_precio] (paralelo x2)")
+        subestado = {"messages": estado["messages"], "info_prereserva": []}
+        return [
+            Send("nodo_verificar_disponibilidad", subestado),
+            Send("nodo_calcular_precio",          subestado),
+        ]
     else:
         print("  ✅ Decisión: → __end__  (sin herramienta necesaria)")
         return "__end__"
 
 
 # ─────────────────────────────────────────────
-# 10. CONSTRUCCIÓN DEL GRAFO
+# 11. CONSTRUCCIÓN DEL GRAFO CON PARALELISMO
 # ─────────────────────────────────────────────
 def construir_grafo():
     """
-    Construye, configura y compila el StateGraph del restaurante.
+    Construye, configura y compila el StateGraph del restaurante
+    con MAP-REDUCE dinámico y HITL.
 
-    Novedades HITL:
-      - MemorySaver como checkpointer: persiste el estado entre llamadas a invoke().
-        Cada conversación se identifica por su thread_id en el config.
-      - interrupt_before=["crear_reserva"]: el grafo se pausa justo antes de
-        ejecutar nodo_crear_reserva y devuelve el control al llamador (chat_interactivo)
-        para que el usuario apruebe o rechace la reserva.
-
-    Estructura:
-      START → agent → [router] → ver_menu      → agent → END
-                               → crear_reserva → agent → END   (⏸ PAUSA aquí)
-                               → END
+    Estructura completa:
+      START → agent ──[router_condicional (MAP)]──► [nodo_procesar_categoria x3] ──► ver_menu_aggregator (REDUCE) ─► agent → END
+                          │
+                          └───► [nodo_verificar_disp. ‖ nodo_calcular_precio] ──► prereserva_aggregator ──► crear_reserva (HITL) ──► agent → END
     """
-    print("\n🔧 Construyendo el grafo LangGraph con Human-in-the-Loop...")
+    print("\n🔧 Construyendo el grafo LangGraph con MAP-REDUCE + HITL...")
 
     grafo = StateGraph(EstadoRestaurante)
 
-    grafo.add_node("agent",         nodo_agent)
-    grafo.add_node("ver_menu",      nodo_ver_menu)
-    grafo.add_node("crear_reserva", nodo_crear_reserva)
+    # ── Nodos ──
+    grafo.add_node("agent",                       nodo_agent)
+    
+    # Menú
+    grafo.add_node("nodo_procesar_categoria",     nodo_procesar_categoria)
+    grafo.add_node("ver_menu_aggregator",         nodo_ver_menu_aggregator)
 
-    grafo.add_edge(START,           "agent")
-    grafo.add_edge("ver_menu",      "agent")
-    grafo.add_edge("crear_reserva", "agent")
+    # Reserva
+    grafo.add_node("nodo_verificar_disponibilidad", nodo_verificar_disponibilidad)
+    grafo.add_node("nodo_calcular_precio",        nodo_calcular_precio)
+    grafo.add_node("prereserva_aggregator",       nodo_prereserva_aggregator)
+    grafo.add_node("crear_reserva",               nodo_crear_reserva)
 
+    # ── Edges ──
+    grafo.add_edge(START, "agent")
+
+    # ── Edges condicionales desde agent ──
+    # router_condicional se encarga de bifurcar en Map-Reduce (retornando Sends)
+    # o de terminar (retornando __end__).
     grafo.add_conditional_edges(
         "agent",
         router_condicional,
         {
-            "ver_menu":      "ver_menu",
-            "crear_reserva": "crear_reserva",
-            "__end__":       END,
+            "__end__": END,
         }
     )
 
-    # ── Checkpointer: guarda el estado completo en memoria entre invocaciones ──
-    memory = MemorySaver()
+    # ── Edges de Menú ──
+    grafo.add_edge("nodo_procesar_categoria", "ver_menu_aggregator")
+    grafo.add_edge("ver_menu_aggregator", "agent")
 
-    # ── interrupt_before: pausa el grafo ANTES de crear_reserva ──
+    # ── Edges de Reserva ──
+    grafo.add_edge("nodo_verificar_disponibilidad", "prereserva_aggregator")
+    grafo.add_edge("nodo_calcular_precio",          "prereserva_aggregator")
+    grafo.add_edge("prereserva_aggregator",         "crear_reserva")
+    grafo.add_edge("crear_reserva",                 "agent")
+
+    # ── Checkpointer + HITL ──
+    memory = MemorySaver()
     app = grafo.compile(
         checkpointer=memory,
         interrupt_before=["crear_reserva"],
     )
 
-    print("✅ Grafo compilado con HITL (MemorySaver + interrupt_before=[crear_reserva]).\n")
+    print("✅ Grafo compilado con MAP-REDUCE dinámico (Send API) + HITL.\n")
     return app

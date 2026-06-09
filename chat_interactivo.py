@@ -1,25 +1,36 @@
 """
 =============================================================================
-  MODO INTERACTIVO — Restaurante La Buena Mesa  (con Human-in-the-Loop)
+  MODO INTERACTIVO — Restaurante La Buena Mesa
+  (con Paralelismo Send API + Human-in-the-Loop)
 =============================================================================
-  Human-in-the-Loop implementado:
+  Funcionalidades activas:
 
-  1. MEMORIA DE CONVERSACIÓN
+  1. PARALELISMO — Send API (fan-out / fan-in)
+     a) Menú: ver_menu_dispatcher lanza 3 nodos en paralelo
+        (entrantes, principales, postres) → ver_menu_aggregator
+     b) Reserva: prereserva_dispatcher lanza 2 nodos en paralelo
+        (verificar_disponibilidad, calcular_precio) → prereserva_aggregator
+
+  2. MEMORIA DE CONVERSACIÓN
      Cada sesión tiene un thread_id único. LangGraph guarda el estado
      completo (historial de mensajes) en el MemorySaver entre turnos, por
      lo que el agente recuerda el contexto de toda la sesión.
 
-  2. APROBACIÓN DE RESERVAS
+  3. APROBACIÓN DE RESERVAS (Human-in-the-Loop)
      Antes de ejecutar nodo_crear_reserva, el grafo hace INTERRUPT y
-     devuelve el control aquí. El usuario ve lo que el agente propone y
-     decide si confirmar (s) o rechazar (n) la reserva.
+     devuelve el control aquí. El usuario decide si confirmar o rechazar.
 
-     ┌─ Flujo normal ────────────────────────────────────────────────────┐
-     │  usuario escribe → invoke() → agent → router → ⏸ INTERRUPT        │
-     │  chat pregunta "¿Confirmas?" → usuario responde                    │
-     │  SI confirma  → invoke(None)  → crear_reserva → agent → END       │
-     │  SI rechaza   → update_state  → invoke(None)  → agent → END       │
-     └───────────────────────────────────────────────────────────────────┘
+     ┌─ Flujo menú (paralelo) ────────────────────────────────────────────┐
+     │  usuario → agent → dispatcher → [entrantes ‖ principales ‖ postres]│
+     │                    aggregator → agent → respuesta al usuario        │
+     └────────────────────────────────────────────────────────────────────┘
+
+     ┌─ Flujo reserva (paralelo + HITL) ──────────────────────────────────┐
+     │  usuario → agent → dispatcher → [verificar_disp. ‖ calc_precio]    │
+     │                    aggregator → ⏸ INTERRUPT (aprobación humana)     │
+     │  SI confirma  → invoke(None) → crear_reserva → agent → END         │
+     │  SI rechaza   → update_state → invoke(None)  → agent → END         │
+     └────────────────────────────────────────────────────────────────────┘
 
   Escribe 'salir' o 'exit' para terminar.
 =============================================================================
@@ -44,7 +55,7 @@ def mostrar_respuesta(contenido: str, prefijo: str = "  🤖 MesaBot →") -> No
     # Los mensajes [MENU], [RESERVA], [RESERVA_CANCELADA] son internos del grafo;
     # el agente los procesa y genera su propia respuesta humana. Si por algún
     # motivo llegaran aquí, los filtramos.
-    for tag in ("[MENU]", "[RESERVA]", "[RESERVA_CANCELADA]"):
+    for tag in ("[MENU]", "[RESERVA]", "[RESERVA_CANCELADA]", "[PRE_RESERVA]"):
         if contenido.startswith(tag):
             return
     print(f"\n{prefijo}\n")
